@@ -93,7 +93,9 @@ python bench.py --no-ref         # 跳过正确性校验, 只测速
 
 ### Google Colab（A100 / L4 / T4）
 
-直接打开仓库里的 `attention_lab.ipynb`，它会依次完成：环境检查 → clone 仓库 → 实测硬件峰值 → 跑全部 kernel → 输出上面的结果表。运行时记得选 GPU：`运行时 → 更改运行时类型 → T4 GPU / L4 / A100`。
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AwakeZz/attention-lab/blob/main/attention_lab.ipynb)
+
+点上面徽章直接打开 notebook，Run All 即可。它会依次完成：环境检查 → 从本仓库 clone 代码 → 实测硬件峰值 → 跑全部 kernel → 输出上面的结果表。运行时记得选 GPU：`运行时 → 更改运行时类型 → T4 GPU / L4 / A100`。
 
 > 用 Google AI Pro 的 Colab 算力：每月 200 计算单元，可按量换取 A100 80GB（约每 100 单元 13–15 小时）。GPU 型号由 Colab 动态分配，不保证每次都是 A100——这没关系，`bench.py` 的分母是运行时实测的，任何卡都能给出可比的数字。
 
