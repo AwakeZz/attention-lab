@@ -52,7 +52,7 @@ prefill                causal prefill      decode              decode+GQA       
 
 ## 硬件与实测结果
 
-本地基线（RTX 3050 Ti Laptop，sm_86，20 SM，4 GB，45 W 功耗墙）：
+本地基线（RTX 3050 Ti Laptop，sm_86，20 SM，4 GB，45 W 功耗墙）。**下面的数字是本地 Ampere 的成绩**——Colab 免费档的 T4(sm_75) 因 Triton 后端退化跑不出这个水平，原因见[「T4 上的性能异常」](#t4-上的性能异常一次后端归因)。
 
 | 项 | 值 |
 |---|---|
@@ -91,13 +91,15 @@ python bench.py --only 14 16     # 只跑指定题号
 python bench.py --no-ref         # 跳过正确性校验, 只测速
 ```
 
-### Google Colab（A100 / L4 / T4）
+### Google Colab（免费档 T4）
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AwakeZz/attention-lab/blob/main/attention_lab.ipynb)
 
-点上面徽章直接打开 notebook，Run All 即可。它会依次完成：环境检查 → 从本仓库 clone 代码 → 实测硬件峰值 → 跑全部 kernel → 输出上面的结果表。运行时记得选 GPU：`运行时 → 更改运行时类型 → T4 GPU / L4 / A100`。
+点上面徽章直接打开 notebook，Run All 即可。它会依次完成：环境检查 → 从本仓库 clone 代码 → 实测硬件峰值 → 跑全部 kernel → 输出结果表。运行时选 `T4 GPU`。
 
-> 用 Google AI Pro 的 Colab 算力：每月 200 计算单元，可按量换取 A100 80GB（约每 100 单元 13–15 小时）。GPU 型号由 Colab 动态分配，不保证每次都是 A100——这没关系，`bench.py` 的分母是运行时实测的，任何卡都能给出可比的数字。
+> **免费 Colab 只能选 T4（或 TPU，后者跑不了 CUDA kernel）**。T4 上七题**功能全部正确**（7/7 过 fp32 校验），但 `% 峰值` 只有个位数——这不是 kernel 写得差，是 Triton 3.8 对 sm_75 的 `tl.dot` 后端退化。有完整的对照实验和归因，见下面[「T4 上的性能异常：一次后端归因」](#t4-上的性能异常一次后端归因)。**评价性能请看上表的本地 Ampere 数字**，Colab 只用来验证"能跑、结果对"。
+
+> 注：Google AI Pro 的 Colab 算力文档上写可按量换 A100，但实际分配由 Colab 动态决定，免费/部分档位只开放 T4；不要假设一定能选到 A100。任何卡上 `bench.py` 的分母都是运行时实测的，数字口径统一——只是 sm_75 会触发后端退化。
 
 ---
 
@@ -107,6 +109,8 @@ python bench.py --no-ref         # 跳过正确性校验, 只测速
 attention-lab/
 ├── bench.py                       # 统一 benchmark: 硬件画像 + 正确性 + 计时 + SDPA 对标
 ├── attention_lab.ipynb            # Colab 一键运行
+├── diag_turing.py                 # 诊断 sm_75 的 shared / spills / 最优 warps×stages
+├── diag_gemm.py                   # 对照实验: Triton 纯 GEMM vs cuBLAS, 定位后端退化
 ├── README.md
 └── kernels/
     ├── 13_attn_naive.py           # 反面教材: QKᵀ→softmax→PV 三趟, 中间 (S,S) 落盘
@@ -119,6 +123,38 @@ attention-lab/
 ```
 
 每个 kernel 文件的 docstring 都是一份独立教程：变量词典 → 数学推导 → 分块实现 → 踩过的坑 → 实测归因。中文注释，公式保留英文符号。
+
+---
+
+## T4 上的性能异常：一次后端归因
+
+把项目丢到免费 Colab 的 T4 上，七题功能全对，但 `% 峰值` 只有 1–4%，第 14 题比 PyTorch SDPA 慢 6 倍。同一个 kernel 在本地 3050 Ti 是 66% 峰值、超 SDPA 1.45×。**同一个二进制，换个卡差 20 倍——这种反直觉的数字不能猜，要证。**
+
+### 第一步：排除"峰值分母算错"
+
+`bench.py` 的分母是运行时实测的（GEMM 测算力、copy 测带宽），T4 报 26 TFLOPS 合理。分母没错。
+
+### 第二步：怀疑是硬件架构差异，不是代码
+
+T4 是 Turing(sm_75)，本地是 Ampere(sm_86)。先修掉了两个**真实存在**的架构兼容问题：
+
+1. **第 17 题 shared memory 崩溃**：sm_75 的 MMA 布局不支持 3D batched dot 的 batch 维，编译器把 `(GROUP=4, BN, BD)` 真实复制 4 份，shared 从 18 KB 涨到 80 KB，超 T4 上限直接 `OutOfResources`。改成把 4 个 head 的 query 沿 M 拼成 2D dot（`_split_kernel_2d`），shared 降到 24 KB，输出逐字节一致。`diag_turing.py` 记录了这个过程。
+2. **寄存器溢出**：诊断脚本测出 sm_75 上 `num_warps=4` 时每线程 255 寄存器还溢出 410 次到 local memory；改 8 warps 后溢出降到 58，第 14 题 2.97 → 1.82 ms。含 `tl.dot` 的 kernel 在 sm_75 上自动切 8 warps。
+
+但这两步修完，全量重跑**仍然只有 4% 峰值**。说明还有更底层的原因。
+
+### 第三步：用纯 GEMM 做对照实验，一锤定音
+
+不去调 attention——直接测 Triton 的 `tl.dot` 在 T4 上**连最基础的矩阵乘**能跑多快，和 cuBLAS 比。`diag_gemm.py` 扫了 2048³ fp16 GEMM 的全部 tile × warps × stages 组合：
+
+| | cuBLAS (`torch.mm`) | Triton 纯 GEMM 最高 | 寄存器溢出 |
+|---|---|---|---|
+| **T4 (sm_75)** | 27.2 TFLOPS | **2.9 TFLOPS（11%）** | `spill` 高达 **2774** 次 |
+| **3050 Ti (sm_86)** | 15.1 TFLOPS | **16.7 TFLOPS（>100%）** | `spill = 0` |
+
+结论没有歧义：**Triton 3.8 在 sm_75 上的 `tl.dot` 后端退化**——连纯矩阵乘都只有 cuBLAS 的 1/9，且大量配置把寄存器溢出到显存。T4 上再怎么调 attention 的 tile/warps 都翻不出这个天花板。**这是编译器后端缺陷，不是 kernel 逻辑错误**：同样的代码在 sm_86 上 spill=0、跑满甚至超过 cuBLAS。
+
+> 这次排查的价值不在于"把 T4 调到 60%"（做不到，也不该做），而在于**用对照实验把性能问题归因到正确的层次**：是代码？是配置？还是后端？每一步都有可复现的数据支撑，而不是停下来猜"可能是卡老了吧"。
 
 ---
 
