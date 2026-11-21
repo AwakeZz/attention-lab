@@ -361,6 +361,11 @@ def run(q, k, v, o, lse, do, dq, dk, dv):
     # 张量直接顶到 106 KB 超上限。这两组尺寸只验正确性不测速, 降一级流水
     # (num_stages=1) 换回空间即可; 主路径一个字节都不变。
     stages = 2 if d <= 64 else 1
+    # Turing (sm_75, 如 T4) 的 MMA 布局展开后 shared 占用比 Ampere 大得多,
+    # dkdv 在 Ampere 上 48.5 KB, 老卡上可能翻倍超 T4 的 64 KB 上限。
+    # 老卡统一降一级流水换回空间, 主路径 (Ampere+) 一个字节都不变。
+    if torch.cuda.get_device_capability(q.device)[0] < 8:
+        stages = 1
 
     _dq_kernel[(triton.cdiv(S, BM),)](
         q, k, v, o, lse, do, dq, S, d, scale, BM, BN, BD,

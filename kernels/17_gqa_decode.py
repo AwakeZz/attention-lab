@@ -184,6 +184,29 @@ merge 的 BM 不跟 split 共用。注意 run() 的条件 `cdiv(Sq,BM_M*2)*HQ >=
 
 按块切不按元素切: 按元素切会让相邻段重叠, 那些 key 的 exp 被算两次, 分母偏大。
 Sk 恰好是 NSPLIT*BN 的整数倍时会静默通过, 只有不整除的尺寸才露馅。
+
+--- 5.5 一个只在 Colab T4 上炸的坑: 3D batched dot 的 shared memory ---
+
+本地 3050 Ti (Ampere sm_86) 全量 7/7 通过, 丢到 Colab 的 T4 (Turing sm_75) 却在
+第 17 题崩 `OutOfResources: Required 81920, Hardware limit 65536` —— 需要 80 KB,
+T4 只有 64 KB。
+
+诡异的是同一份 kernel 在本地编译只报 18 KB shared。差 4 倍多, 正好是 GROUP=4。
+原因在 MMA 布局: Ampere 上 `broadcast(k)->(GROUP,BN,BD)` 是零拷贝 view, 4 个 head
+的 batched dot 共用同一份 K/V 物理内存; 而 Turing 的 MMA 指令格式不支持这种
+batch 维, 编译器把 GROUP 维**真的复制展开**成 4 份, shared 直接 ×4 = 72~80 KB,
+超上限。
+
+修法是换等价的 2D 写法 (`_split_kernel_2d`): 把 GROUP 个 head 的 query 行沿 M 维
+拼成 (GROUP*BM, BD) = (64, 64), K/V 保持 (BN, BD) 走标准 2D dot。省带宽的语义
+一点没丢 —— K/V 依然只读一次、4 个 head 共用, 只是从"一次 batched dot"变成
+"一次更大的 2D dot", 编译器不再需要展开 batch 维。实测两边输出逐字节一致
+(3D vs 2D max diff = 0; 2D+merge 对 fp32 参考 max diff = 1.4e-05), shared 从
+80 KB 降到 24 KB。
+
+run() 里按 `get_device_capability()[0]` 分派: Ampere+ 走更快的 3D 版,
+Turing 及更早走 2D 版。**这是"同一份数学、不同硬件走不同编译路径"的典型案例**:
+不是算法错了, 是编译器对同一写法的资源代价因架构而异。面试可讲。
 """
 
 import torch
@@ -282,6 +305,79 @@ def _split_kernel(
 
 
 @triton.jit
+def _split_kernel_2d(
+    q_ptr, k_ptr, v_ptr, op_ptr, lse_ptr,
+    HQ, HKV, Sq, Sk, d, scale,
+    BM: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+    GROUP: tl.constexpr, NSPLIT: tl.constexpr,
+):
+    """3D batched dot 的低共享内存版本 (给 Turing sm_75 等老卡)。
+
+    上面的 _split_kernel 把 K/V broadcast 成 (GROUP,BN,BD) 做 3D batched dot。
+    Ampere+ 上这是零拷贝 view, shared 只要 18 KB; 但 Turing 的 MMA 布局会把
+    GROUP 维真的展开, 实测需要 80 KB —— 超过 T4 的 64 KB 上限直接崩。
+
+    这里换一种等价写法: 把 GROUP 个 q head 的行沿 M 维拼成 (GROUP*BM, BD),
+    K/V 保持 (BN,BD) 用标准 2D dot。K/V 依然只读一次、GROUP 个 head 共用,
+    省带宽的语义完全不变; shared 降到 24 KB, 且与 3D 版数值逐字节一致。
+    """
+    kv_h = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_s = tl.program_id(2)
+
+    M: tl.constexpr = GROUP * BM
+    offs_r = tl.arange(0, M)
+    g = offs_r // BM                 # 组内第几个 q head
+    m_loc = offs_r % BM
+    hq = kv_h * GROUP + g
+    offs_m = pid_m * BM + m_loc
+    offs_d = tl.arange(0, BD)
+
+    q = tl.load(
+        q_ptr + hq[:, None] * (Sq * d) + offs_m[:, None] * d + offs_d[None, :],
+        mask=(offs_m[:, None] < Sq) & (offs_d[None, :] < d), other=0.0,
+    )
+
+    m_i = tl.full((M,), -float("inf"), tl.float32)
+    l_i = tl.zeros((M,), tl.float32)
+    acc = tl.zeros((M, BD), tl.float32)
+
+    nblk = tl.cdiv(Sk, BN)
+    per = tl.cdiv(nblk, NSPLIT)
+    b0 = pid_s * per
+    b1 = tl.minimum(b0 + per, nblk)
+
+    for n0 in range(b0, b1):
+        offs_n = n0 * BN + tl.arange(0, BN)
+        mask_n = offs_n < Sk
+        k = tl.load(
+            k_ptr + kv_h * (Sk * d) + offs_n[:, None] * d + offs_d[None, :],
+            mask=mask_n[:, None] & (offs_d[None, :] < d), other=0.0,
+        )
+        v = tl.load(
+            v_ptr + kv_h * (Sk * d) + offs_n[:, None] * d + offs_d[None, :],
+            mask=mask_n[:, None] & (offs_d[None, :] < d), other=0.0,
+        )
+        qk = tl.dot(q, tl.trans(k)) * scale          # (M, BN), 标准 2D
+        qk = tl.where(mask_n[None, :], qk, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.float16), v, acc)
+        m_i = m_new
+
+    l_safe = tl.where(l_i > 0, l_i, 1.0)
+    o = acc / l_safe[:, None]
+    tl.store(op_ptr + (pid_s * HQ + hq[:, None]) * (Sq * d)
+             + offs_m[:, None] * d + offs_d[None, :], o,
+             mask=(offs_m[:, None] < Sq) & (offs_d[None, :] < d))
+    lse = tl.where(l_i > 0, m_i + tl.log(l_i), -float("inf"))
+    tl.store(lse_ptr + (pid_s * HQ + hq) * Sq + offs_m, lse, mask=offs_m < Sq)
+
+
+@triton.jit
 def _merge_kernel(
     op_ptr, lse_ptr, o_ptr,
     HQ, Sq, d,
@@ -350,7 +446,12 @@ def run(q, k, v, out, nsplit_override=None):
 
     op, lse = _buffers(nsplit, HQ, Sq, d, q.device)
 
-    _split_kernel[(HKV, triton.cdiv(Sq, BM), nsplit)](
+    # Turing (sm_75, 如 T4) 的 MMA 布局会把 3D batched dot 的 GROUP 维真的展开,
+    # shared 从 Ampere 的 18 KB 暴涨到 80 KB, 超 T4 的 64 KB 上限直接崩。
+    # 老卡改用等价的 2D 拼行版 (shared 24 KB), 数值逐字节一致。
+    cap_major = torch.cuda.get_device_capability(q.device)[0]
+    split_fn = _split_kernel if cap_major >= 8 else _split_kernel_2d
+    split_fn[(HKV, triton.cdiv(Sq, BM), nsplit)](
         q, k, v, op, lse,
         HQ, HKV, Sq, Sk, d, scale,
         BM, BN, BD, GROUP, nsplit,
