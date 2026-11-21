@@ -237,6 +237,9 @@ def run(q, k, v, out):
     # "BM 的结论和第 14 题相反"), 32 是负载均衡和算术强度的交叉点。
     BM, BN = 32, 64
     grid = (triton.cdiv(S, BM),)
+    # Turing(sm_75): 4 warps 寄存器溢出严重 (见第14题 diag_turing.py 实测),
+    # 8 warps 把每线程 acc 负载减半, spills 骤降。Ampere+ 保持 4 不变。
+    wm = 8 if torch.cuda.get_device_capability(q.device)[0] < 8 else 4
     flash_attn_causal_kernel[grid](
         q, k, v, out, S, d, scale, BM, BN, BD,
-        num_warps=4, num_stages=2)
+        num_warps=wm, num_stages=2)

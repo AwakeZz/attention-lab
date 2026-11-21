@@ -367,11 +367,15 @@ def run(q, k, v, o, lse, do, dq, dk, dv):
     if torch.cuda.get_device_capability(q.device)[0] < 8:
         stages = 1
 
+    # 寄存器溢出: 和第14题同构, 4 warps 时 (64,64) 的 acc 顶满 255 regs,
+    # 在 T4 上溢出到 local memory; 8 warps 每线程负载减半 (diag_turing.py 实测
+    # 第14题 spills 410→58、快 1.6x)。Ampere+ 保持 4 不变。
+    wm = 8 if torch.cuda.get_device_capability(q.device)[0] < 8 else 4
     _dq_kernel[(triton.cdiv(S, BM),)](
         q, k, v, o, lse, do, dq, S, d, scale, BM, BN, BD,
-        num_warps=4, num_stages=stages,
+        num_warps=wm, num_stages=stages,
     )
     _dkdv_kernel[(triton.cdiv(S, BN),)](
         q, k, v, o, lse, do, dk, dv, S, d, scale, BM, BN, BD,
-        num_warps=4, num_stages=stages,
+        num_warps=wm, num_stages=stages,
     )

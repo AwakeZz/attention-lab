@@ -206,6 +206,10 @@ def run(q, k, v, out):
 
     BM, BN = 64, 64
     grid = (triton.cdiv(S, BM),)
+    # Turing(sm_75): 4 warps 时 acc 顶满 255 regs 溢出 410 次到 local memory,
+    # 8 warps 把每线程负载减半, spills 410→58、实测 2.97→1.82 ms (diag_turing.py)。
+    # Ampere+ 保持 4 不变。8 warps 不改变 shared (都是 32 KB), stages=2 实测最优。
+    wm = 8 if torch.cuda.get_device_capability(q.device)[0] < 8 else 4
     flash_attn_kernel[grid](
         q, k, v, out, S, d, scale, BM, BN, BD,
-        num_warps=4, num_stages=2)
+        num_warps=wm, num_stages=2)

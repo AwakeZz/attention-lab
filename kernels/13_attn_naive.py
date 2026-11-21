@@ -152,12 +152,16 @@ def run(q, k, v, out):
     S, d = q.shape
     scale = 1.0 / (d ** 0.5)
     BD = triton.next_power_of_2(d)
+    # Turing(sm_75, 如 T4) 每 SM 寄存器少: 4 warps 时 acc 顶满 255 regs 还溢出
+    # 到 local memory, 8 warps 让每线程负载减半。diag_turing.py 在第14题实测
+    # spills 410→58、2.97→1.82 ms。Ampere+ 保持 4 不变。
+    wm = 8 if torch.cuda.get_device_capability(q.device)[0] < 8 else 4
 
     # 1) S = Q Kᵀ * scale
     s = torch.empty((S, S), device=q.device, dtype=torch.float16)
     BM, BN = 64, 64
     attn_scores_kernel[(triton.cdiv(S, BM), triton.cdiv(S, BN))](
-        q, k, s, S, d, scale, BM, BN, BD, num_warps=4)
+        q, k, s, S, d, scale, BM, BN, BD, num_warps=wm)
 
     # 2) P = softmax(S, dim=-1)
     p = torch.empty_like(s)
@@ -167,4 +171,4 @@ def run(q, k, v, out):
     # 3) O = P V
     BM2, BK = 64, 64
     attn_pv_kernel[(triton.cdiv(S, BM2),)](
-        p, v, out, S, d, BM2, BK, BD, num_warps=4)
+        p, v, out, S, d, BM2, BK, BD, num_warps=wm)
